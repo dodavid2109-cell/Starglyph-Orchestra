@@ -321,6 +321,8 @@ canvas{image-rendering:pixelated;image-rendering:crisp-edges}
 .tk-tools{display:flex;gap:8px}
 .tk-tools .pb{flex:1}
 .tk-dl{background:var(--a5, var(--btn))}
+.tk-render{padding:12px 12px 4px}
+.tk-render .pb{width:100%}
 .tk-busy{padding:10px;border:var(--bw) dashed var(--line);text-align:center;font-variant-numeric:tabular-nums}
 .tk-empty,.tk-note{margin:12px;font-size:var(--fs-s, 13px);opacity:.8}
 @keyframes blink{50%{opacity:.55}}
@@ -496,8 +498,8 @@ canvas{image-rendering:pixelated;image-rendering:crisp-edges}
 <div class="veil" id="takeVeil"><div class="win" role="dialog" aria-modal="true" aria-labelledby="tkT">
   <div class="bar b-mix"><button class="ib" data-close aria-label="Close">&lt;</button><h2 id="tkT">Recordings</h2><span class="ib" aria-hidden="true" style="visibility:hidden"></span></div>
   <div class="dither"></div>
-  <div class="scroll body takes"><div id="takeList"></div>
-    <p class="tk-note">Recordings are saved as MP3 on this device, like your shelf. They stay until you delete them or clear this browser's data.</p></div>
+  <div class="scroll body takes"><div class="tk-render"><button class="pb" id="renderBtn" type="button">Render this book as WAV</button></div><div id="takeList"></div>
+    <p class="tk-note">Render builds the whole book once at 44.1 kHz, 16-bit stereo, ready for release. Rec takes save as MP3. Both stay on this device, like your shelf, until you delete them or clear this browser's data.</p></div>
 </div></div>
 
 <div class="veil" id="skinVeil"><div class="win" role="dialog" aria-modal="true" aria-labelledby="skT">
@@ -2539,14 +2541,23 @@ function applyMix(){
 function ready(tr){ var k = spriteKey(INSTR[tr.inst]); return !k || !!smpBuf[k]; }
 function schedule(){
   if (!playing) return;
-  var bd = beatDur(), ahead = ac.currentTime + .3, legato = legatoV / 100, allDone = true;
+  var ahead = ac.currentTime + .3, allDone = true;
   tracks.forEach(function(tr){
     if (!tr.score || !tr.gain || !ready(tr)) return;
+    if (!(tr.score.beats > 0)) return;
+    queueTrack(tr, ahead, 500, looping);
+    var list = (INSTR[tr.inst].perc || INSTR[tr.inst].kit) ? tr.score.notes : tr.score.phrases;
+    if (looping || tr.ptr < list.length) allDone = false;
+  });
+  if (allDone && ac.currentTime - startTime > longest + 1.2) stopAll();
+}
+/* queue a channel's notes that start before 'ahead' (seconds on the audio clock) */
+function queueTrack(tr, ahead, maxItems, loop){
+    var bd = beatDur(), legato = legatoV / 100;
     var def = INSTR[tr.inst], sb = tr.score.beats, step = bd / tr.rate, guard = 0;
-    if (!(sb > 0)) return;
     var perc = def.perc || def.kit, list = perc ? tr.score.notes : tr.score.phrases;
-    while (guard++ < 500){
-      if (tr.ptr >= list.length){ if (!looping) break; tr.cyc++; tr.ptr = 0; continue; }
+    while (guard++ < maxItems){
+      if (tr.ptr >= list.length){ if (!loop) break; tr.cyc++; tr.ptr = 0; continue; }
       var item = list[tr.ptr], head = perc ? item : item[0];
       var when = startTime + (head.t + tr.cyc * sb) * step;
       if (when > ahead) break;
@@ -2566,9 +2577,6 @@ function schedule(){
       }
       tr.ptr++;
     }
-    if (looping || tr.ptr < list.length) allDone = false;
-  });
-  if (allDone && ac.currentTime - startTime > longest + 1.2) stopAll();
 }
 function paint(){
   if (!playing) return;
@@ -2709,6 +2717,89 @@ function recMime(){
 function recName(){
   var t = null; tracks.forEach(function(tr){ if (!t && isLive(tr)) t = tr.text; });
   return ((t || 'starglyph').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 44)) || 'starglyph';
+}
+/* ---- Render: the open book, played once from start to end, built offline at
+   44.1 kHz stereo and saved as a 16-bit WAV take. Nothing is played aloud, so
+   timing is exact and nothing glitches, and it runs faster than real time.   */
+var rendering = false;
+function renderBook(onProg){
+  if (rendering) return Promise.reject(new Error('busy'));
+  initAudio(); applyMix(); stopAll(); rebuild();
+  if (longest <= .002) return Promise.reject(new Error('empty'));
+  var keys = {};
+  tracks.forEach(function(tr){ if (!isLive(tr)) return; var k = spriteKey(INSTR[tr.inst]); if (k && !smpBuf[k]) keys[k] = 1; });
+  rendering = true;
+  return Promise.all(Object.keys(keys).map(function(k){ return loadSprite(k); })).then(function(){
+    var SR = 44100, secs = longest + 4.5, total = Math.ceil(SR * secs);
+    var live = { ac:ac, comp:comp, master:master, dryG:dryG, wetG:wetG, noiseBuf:noiseBuf, startTime:startTime };
+    var off = new OfflineAudioContext(2, total, SR);
+    ac = off; noiseBuf = mkNoise();
+    comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = .004; comp.release.value = .25;
+    master = ac.createGain(); master.gain.value = volV / 100;
+    comp.connect(master); master.connect(ac.destination);
+    dryG = ac.createGain(); dryG.gain.value = 1; dryG.connect(comp);
+    var rv = mkHall(2.4);
+    wetG = ac.createGain(); wetG.gain.value = echoV / 100;
+    wetG.connect(rv); rv.connect(comp);
+    startTime = .15;
+    tracks.forEach(function(tr){
+      tr.ptr = 0; tr.cyc = 0; tr.busy = {};
+      if (!tr.score) return;
+      makeChain(tr);
+      if (tr.score.beats > 0 && ready(tr)) queueTrack(tr, Infinity, 1e6, false);
+    });
+    /* back to the live graph; the offline one keeps what was queued */
+    ac = live.ac; comp = live.comp; master = live.master; dryG = live.dryG; wetG = live.wetG;
+    noiseBuf = live.noiseBuf; startTime = live.startTime;
+    tracks.forEach(function(tr){ if (tr.score) makeChain(tr); });
+    for (var s = 4; s < secs; s += 4) (function(at){
+      off.suspend(at).then(function(){ if (onProg) onProg(at / secs); off.resume(); });
+    })(s);
+    return off.startRendering();
+  }).then(function(buf){ rendering = false; return toWav(buf); },
+          function(e){ rendering = false; throw e; });
+}
+function toWav(buf){
+  var L = buf.getChannelData(0), R = buf.numberOfChannels > 1 ? buf.getChannelData(1) : L, n = L.length, peak = 0, last = 0;
+  for (var i = 0; i < n; i++){
+    var a = Math.abs(L[i]), b = Math.abs(R[i]); if (a > peak) peak = a; if (b > peak) peak = b;
+    if (a > 1e-4 || b > 1e-4) last = i;
+  }
+  /* end shortly after the last sound, and set the loudest moment to -1 dBFS */
+  n = Math.min(n, last + Math.round(buf.sampleRate * .4));
+  var g = peak > 0 ? .891 / peak : 1, fade = Math.round(buf.sampleRate * .05);
+  var ab = new ArrayBuffer(44 + n * 4), v = new DataView(ab), p = 0;
+  function str(s){ for (var k = 0; k < s.length; k++) v.setUint8(p++, s.charCodeAt(k)); }
+  function u32(x){ v.setUint32(p, x, true); p += 4; }
+  function u16(x){ v.setUint16(p, x, true); p += 2; }
+  str('RIFF'); u32(36 + n * 4); str('WAVE'); str('fmt '); u32(16); u16(1); u16(2);
+  u32(buf.sampleRate); u32(buf.sampleRate * 4); u16(4); u16(16); str('data'); u32(n * 4);
+  for (i = 0; i < n; i++){
+    var f = i > n - fade ? (n - i) / fade : 1;
+    var l = Math.max(-1, Math.min(1, L[i] * g * f)), r = Math.max(-1, Math.min(1, R[i] * g * f));
+    v.setInt16(p, l < 0 ? l * 32768 : l * 32767, true); p += 2;
+    v.setInt16(p, r < 0 ? r * 32768 : r * 32767, true); p += 2;
+  }
+  return { blob:new Blob([ab], { type:'audio/wav' }), secs:n / buf.sampleRate };
+}
+function startRender(btn){
+  if (rendering || recorder || recArmed) return;
+  if (playing || starting) stopAll();
+  var book = (typeof current !== 'undefined' && current && current.title) || recName();
+  var num = takes.reduce(function(m, t){ return Math.max(m, t.n); }, 0) + 1;
+  var t = { id:'t' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), n:num, secs:0,
+            title:book, created:Date.now(), busy:0, kind:'WAV' };
+  takes.unshift(t); renderTakes(); btn.disabled = true;
+  statusMsg = 'RENDERING'; refreshStatus();
+  function prog(f){ t.busy = f; var el = document.querySelector('[data-take="' + t.id + '"] .tk-busy'); if (el) el.textContent = 'Rendering WAV ' + Math.round(f * 100) + '%'; }
+  renderBook(prog).then(function(r){
+    t.audio = r.blob; t.secs = r.secs; t.file = slug(book) + '-' + t.n + '.wav'; delete t.busy;
+    tkPut(t); say('WAV ready');
+  }).catch(function(e){
+    takes.splice(takes.indexOf(t), 1);
+    say(e && e.message === 'empty' ? 'Type some glyphs first' : 'Could not render');
+  }).then(function(){ btn.disabled = false; statusMsg = ''; refreshStatus(); recLabel(); renderTakes(); });
 }
 /* Rec starts the piece and captures it. The button counts the time while it
    records, and the take stops with the music, or when Rec or Stop is pressed.
@@ -2854,20 +2945,20 @@ function renderTakes(){
   var list = $('takeList'); list.innerHTML = '';
   if (!takes.length){
     var p = document.createElement('p'); p.className = 'tk-empty';
-    p.textContent = 'No recordings yet. Press Rec and the piece plays from the start while it records.';
+    p.textContent = 'No recordings yet. Render makes a studio-quality WAV of the open book. Rec records it as it plays.';
     list.appendChild(p); return;
   }
   takes.forEach(function(t, i){
     var row = document.createElement('div'); row.className = 'tk';
     var h = document.createElement('div'); h.className = 'tk-h';
-    var nm = document.createElement('b'); nm.textContent = 'Take ' + t.n + ' · ' + t.title;
+    var nm = document.createElement('b'); nm.textContent = (t.kind === 'WAV' ? 'WAV ' : 'Take ') + t.n + ' · ' + t.title;
     var tm = document.createElement('span');
     tm.textContent = fmtTime(t.secs) + ' · ' + new Date(t.created).toLocaleDateString(undefined, { month:'short', day:'numeric' });
     h.appendChild(nm); h.appendChild(tm);
     row.dataset.take = t.id;
     if (!t.audio){
       var bz = document.createElement('div'); bz.className = 'tk-busy';
-      bz.textContent = 'Making MP3 ' + Math.round((t.busy || 0) * 100) + '%';
+      bz.textContent = (t.kind === 'WAV' ? 'Rendering WAV ' : 'Making MP3 ') + Math.round((t.busy || 0) * 100) + '%';
       row.appendChild(h); row.appendChild(bz); list.appendChild(row); return;
     }
     if (!t.url) t.url = URL.createObjectURL(t.audio);
@@ -2894,6 +2985,7 @@ function renderTakes(){
 }
 var takeVeil = $('takeVeil');
 takeVeil.addEventListener('click', function(e){ if (e.target === takeVeil || e.target.hasAttribute('data-close')) closeVeil(takeVeil); });
+$('renderBtn').addEventListener('click', function(){ startRender($('renderBtn')); });
 $('takesBtn').addEventListener('click', function(){ closeVeil(mixVeil); renderTakes(); openVeil(takeVeil); });
 $('rec').addEventListener('click', function(){ if (recorder || recArmed) stopRec(); else startRec(); });
 tkLoad();
